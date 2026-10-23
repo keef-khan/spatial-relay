@@ -1,5 +1,13 @@
 # Spatial Relay
 
+## macOS 27 compatibility fix — confirmed working on macOS 27.2
+
+This fork of [shevlfs/spatial-relay](https://github.com/shevlfs/spatial-relay) fixes a macOS 27 compatibility problem: the original release displayed **Fixed** and **Head Tracked** in the AirPods menu, but selecting them did not activate the requested mode. The problem was reported in [upstream issue #2](https://github.com/shevlfs/spatial-relay/issues/2).
+
+**Confirmed working on macOS 27.2 by Aakef Khan**, who reported the issue and tested the corrected build. This confirmation applies to that setup; other macOS versions and AirPods models still need testing.
+
+The fork makes the fix available to other users while the changes are proposed to the original project through a pull request. The original app and its foundation are by **shevlfs**; this fork contributes the compatibility changes, diagnostics and validation tools under the same MIT license.
+
 [![CI](https://github.com/shevlfs/spatial-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/shevlfs/spatial-relay/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -18,7 +26,7 @@ The app runs in the menu bar and has no Dock icon. Closing its panel does not st
 - macOS 14.2 or later
 - Spatial Audio-capable AirPods
 - Spotify Desktop (`com.spotify.client`)
-- Xcode 16.4 or later when building from source
+- Xcode 16.4 or later when building from source; the macOS 27 receiver path requires Swift 6.4 and the macOS 27 SDK
 
 ## Install
 
@@ -49,7 +57,9 @@ The relay accepts stereo, native-endian 32-bit floating-point PCM from Core Audi
 
 Audio remains in a bounded in-memory buffer. It is not written to disk, sent over the network, or collected as telemetry. Spotify's original output is muted only while the process tap is active. Normal stop, quit, and failure paths restore direct output.
 
-Spatial Audio mode changes can briefly reconfigure the renderer. Spatial Relay gives those changes a five-second recovery window, flushes and rebases the render timeline, and stops safely if the output does not recover.
+Spatial Audio mode changes can briefly reconfigure the renderer. Spatial Relay uses the system output route and opts stereo PCM into spatialization. On macOS 27, it handles the audio receiver's configuration and automatic-flush suggestions directly. It flushes and rebases audio without pausing the live timebase during those transitions, allows a five-second recovery window, and stops safely if output does not recover. Actual playback underruns still pause and prebuffer the timeline.
+
+Use **… → Copy diagnostics** to copy the renderer backend, output-change counters, capture counters and any error. The last diagnostics remain available after the relay stops. This does not copy recorded audio.
 
 ## Development
 
@@ -68,6 +78,16 @@ xcodebuild \
 CI runs tests, static analysis, and a Release build on a native arm64 macOS runner. Tags matching `vMAJOR.MINOR.PATCH` build an ad-hoc signed app, verify it, and publish a ZIP and SHA-256 checksum to GitHub Releases.
 
 The hosted test suite cannot exercise the System Audio Recording prompt, Spotify playback, AirPods routing, or the Spatial Audio menu. Changes to those paths should also be checked on a physical Mac.
+
+For a local build using Command Line Tools and the macOS 27 SDK:
+
+```sh
+bash Scripts/build-local.sh
+```
+
+This builds `build/SpatialRelay` and runs standalone checks for PCM bytes and timestamps at 44.1/48 kHz, stereo layout, invalid chunks, queue limits, recovery anchors and the capture ring. It also runs a runtime smoke test of the production player with silent PCM, including startup, enqueue, diagnostics, flush, stop/restart and destruction. If AVFoundation cannot initialize a renderer in the build environment, the runtime test reports **SKIP**, not a pass.
+
+For physical-device validation, play Spotify through AirPods, start the relay, and choose **Fixed**, **Head Tracked**, then **Off** for Spatial Relay in the AirPods menu. Check that each selection remains active and playback continues. Also check pause/resume, stop/restart and output disconnection. Copy diagnostics if a mode does not stick or playback stops. Test the legacy renderer on macOS 14.2–26 separately from the macOS 27 receiver path.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security reports are covered by [SECURITY.md](SECURITY.md).
 
