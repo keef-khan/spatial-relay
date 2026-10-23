@@ -28,6 +28,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     private var stalledCaptureChecks = 0
     private var sampleRateMismatchStartTime: DispatchTime?
 
+    private var lastDiagnostics = "Relay has not started."
     private var isActive = false
 
     init() {
@@ -83,8 +84,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             let capture = SRAudioCaptureBridge()
             let player = try SampleBufferPlayer(
                 capture: capture,
-                sampleRate: format.mSampleRate,
-                outputDeviceUID: output.uid
+                sampleRate: format.mSampleRate
             ) { [weak self] error in
                 guard let self else { return }
                 self.controlQueue.async { [weak self] in
@@ -136,6 +136,10 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     private func stopPipeline() -> Error? {
         isActive = false
         return tearDownPipeline()
+    }
+
+    func diagnostics() -> String {
+        performSync { player?.diagnostics() ?? lastDiagnostics }
     }
 
     func metrics() -> RelayMetrics {
@@ -236,6 +240,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         // Spotify), then destroy the aggregate device and process tap.
         var cleanupProblems: [String] = []
 
+        if let player { lastDiagnostics = player.diagnostics() }
         player?.stop()
         player = nil
 

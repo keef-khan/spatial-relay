@@ -41,6 +41,25 @@ enum RendererRecoveryTimeline {
     }
 }
 
+enum RendererQueueWindow {
+    static func canEnqueue(
+        nextFrame: Int64,
+        playhead: CMTime,
+        timescale: CMTimeScale,
+        segmentStartFrame: Int64,
+        timelineIsRunning: Bool
+    ) -> Bool {
+        guard timescale > 0 else { return false }
+        let reference: Int64
+        if timelineIsRunning, playhead.isNumeric {
+            reference = CMTimeConvertScale(playhead, timescale: timescale, method: .roundTowardZero).value
+        } else {
+            reference = segmentStartFrame
+        }
+        return Double(nextFrame) - Double(reference) < Double(timescale) * 0.25
+    }
+}
+
 final class SampleBufferPlayer: @unchecked Sendable {
     typealias FailureHandler = @Sendable (Error) -> Void
 
@@ -55,6 +74,12 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private let prebufferFrameCount: Int64
     private let onFailure: FailureHandler
 
+    // Kept type-erased so the app still launches on macOS 14.2–26.
+    // All receiver access is confined to serializationQueue.
+    private var modernReceiver: Any?
+    private var configurationChangeCount = 0
+    private var automaticFlushCount = 0
+    private var lastRecovery = "None"
     private var timer: DispatchSourceTimer?
     private var notificationTokens: [NSObjectProtocol] = []
     private var nextFrame: Int64 = 0
@@ -74,7 +99,6 @@ final class SampleBufferPlayer: @unchecked Sendable {
     init(
         capture: SRAudioCaptureBridge,
         sampleRate: Double,
-        outputDeviceUID: String,
         onFailure: @escaping FailureHandler
     ) throws {
         let roundedRate = sampleRate.rounded()
@@ -87,7 +111,10 @@ final class SampleBufferPlayer: @unchecked Sendable {
         self.onFailure = onFailure
         self.factory = try PCMSampleBufferFactory(sampleRate: sampleRate)
         self.prebufferFrameCount = max(2_048, Int64(sampleRate * 0.08))
-        renderer.audioOutputDeviceUniqueID = outputDeviceUID
+        // Leave audioOutputDeviceUniqueID at its documented nil default. Even
+        // assigning nil invokes AVFoundation's device reconfiguration setter;
+        // that setter raised an Objective-C exception during testing on macOS 27.2.
+        // The coordinator still stops capture when the actual output changes.
         serializationQueue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -117,7 +144,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
             renderer.allowedAudioSpatializationFormats = .monoAndStereo
             renderer.volume = 1
             synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
-            synchronizer.addRenderer(renderer)
+            attachRenderer()
             synchronizer.setRate(0, time: .zero)
 
             installRendererObservers()
@@ -142,8 +169,12 @@ final class SampleBufferPlayer: @unchecked Sendable {
             timer = nil
 
             synchronizer.setRate(0, time: .invalid)
-            renderer.flush()
-            synchronizer.removeRenderer(renderer, at: .invalid, completionHandler: nil)
+            flushRenderer()
+            // The receiver remains owned by this player until the coordinator
+            // releases it. Legacy renderers retain their original detach path.
+            if modernReceiver == nil {
+                synchronizer.removeRenderer(renderer, at: .invalid, completionHandler: nil)
+            }
             removeRendererObservers()
 
             timelineIsRunning = false
@@ -243,7 +274,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
         }
 
         var receivedData = false
-        while renderer.isReadyForMoreMediaData,
+        while isReadyForMoreMediaData,
               let chunk = capture.dequeueChunk(withMaximumFrameCount: 1_024) {
             do {
                 if enqueuedFrameCount == 0 {
@@ -254,9 +285,11 @@ final class SampleBufferPlayer: @unchecked Sendable {
                     frameCount: chunk.frameCount,
                     startingAtFrame: nextFrame
                 )
-                renderer.enqueue(sampleBuffer)
+                // Account first: a successful enqueue can also request a flush,
+                // which rebases these counters before the next sample is made.
                 nextFrame += Int64(chunk.frameCount)
                 enqueuedFrameCount += Int64(chunk.frameCount)
+                guard enqueue(sampleBuffer) else { return }
                 receivedData = true
             } catch {
                 deliverFailure(error)
@@ -267,7 +300,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
         if receivedData {
             backpressureStartTime = nil
         } else if capture.availableFrameCount >= UInt32(prebufferFrameCount),
-                  !renderer.isReadyForMoreMediaData {
+                  !isReadyForMoreMediaData {
             if let backpressureStartTime {
                 if elapsedMilliseconds(since: backpressureStartTime) > OutputReconfigurationGrace.durationMilliseconds {
                     deliverFailure(RelayError.rendererFailed("the renderer stopped accepting audio"))
@@ -308,7 +341,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
         let restartTime = mediaTime(forFrame: restartFrame)
 
         synchronizer.setRate(0, time: restartTime)
-        renderer.flush()
+        flushRenderer()
         nextFrame = restartFrame
         segmentStartFrame = restartFrame
         enqueuedFrameCount = 0
@@ -317,40 +350,132 @@ final class SampleBufferPlayer: @unchecked Sendable {
         pauseTransitionStartTime = .now()
     }
 
-    /// Spatial Audio mode changes legitimately reconfigure the AirPods output.
-    /// AVFoundation asks clients to flush and enqueue again from the current
-    /// playhead; treating this notification as fatal caused the first toggle to
-    /// stop the relay. Keep captured PCM in the ring, rebase, and prebuffer it.
+    /// Preserve the live timebase during a hardware/spatial-mode transition.
+    /// Apple's automatic-flush contract allows re-enqueueing at currentTime();
+    /// stopping/restarting the session here unnecessarily interrupts mode changes.
     private func recoverRendererAfterConfigurationChange(suggestedFlushTime: CMTime? = nil) {
         guard isStarted && !failureWasDelivered else { return }
         lastRendererConfigurationChangeTime = .now()
-
-        // OutputConfigurationDidChange and WasFlushedAutomatically commonly
-        // arrive as a pair. If the first notification is still waiting for the
-        // timebase to pause, its serialized flush already covers the second.
-        guard !(rendererRecoveryIsActive && pauseTransitionStartTime != nil) else { return }
         rendererRecoveryIsActive = true
-
-        let playhead = synchronizer.currentTime()
         let restartFrame = RendererRecoveryTimeline.restartFrame(
-            currentTime: playhead,
+            currentTime: synchronizer.currentTime(),
             suggestedFlushTime: suggestedFlushTime,
             timescale: timeScale,
             fallbackFrame: nextFrame
         )
-        let restartTime = mediaTime(forFrame: restartFrame)
-
-        synchronizer.setRate(0, time: restartTime)
-        renderer.flush()
-        nextFrame = restartFrame
-        segmentStartFrame = restartFrame
+        flushRenderer()
+        // Leave room for the next pump rather than enqueueing at a timestamp
+        // that will already be in the past when the hardware consumes it.
+        nextFrame = restartFrame + (timelineIsRunning ? prebufferFrameCount : 0)
+        segmentStartFrame = nextFrame
         enqueuedFrameCount = 0
-        timelineIsRunning = false
         backpressureStartTime = nil
-        pauseTransitionStartTime = .now()
+        lastRecovery = "Rebased without pausing playback"
+    }
+
+    private func attachRenderer() {
+        #if compiler(>=6.4)
+        if #available(macOS 27.0, *) {
+            if modernReceiver == nil {
+                modernReceiver = synchronizer.sampleBufferReceiver(adding: renderer)
+            }
+            return
+        }
+        #endif
+        synchronizer.addRenderer(renderer)
+    }
+
+    private var isReadyForMoreMediaData: Bool {
+        if #available(macOS 27.0, *), modernReceiver != nil {
+            return RendererQueueWindow.canEnqueue(
+                nextFrame: nextFrame,
+                playhead: synchronizer.currentTime(),
+                timescale: timeScale,
+                segmentStartFrame: segmentStartFrame,
+                timelineIsRunning: timelineIsRunning
+            )
+        }
+        return renderer.isReadyForMoreMediaData
+    }
+
+    /// Returns false after an error. Never counts a rejected buffer as playing.
+    private func enqueue(_ sampleBuffer: sending CMSampleBuffer) -> Bool {
+        #if compiler(>=6.4)
+        if #available(macOS 27.0, *),
+           let receiver = modernReceiver as? AVSampleBufferAudioRenderer.Receiver {
+            let ready = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sampleBuffer)
+            switch receiver.enqueueImmediately(ready) {
+            case .enqueued:
+                return true
+            case .enqueuedWithSuggestedFlush(let reasons):
+                var flushTime: CMTime?
+                for reason in reasons {
+                    switch reason {
+                    case .wasFlushedAutomatically(let time):
+                        automaticFlushCount += 1
+                        if time.isNumeric,
+                           flushTime == nil || CMTimeCompare(time, flushTime!) > 0 {
+                            flushTime = time
+                        }
+                    case .outputConfigurationChanged:
+                        configurationChangeCount += 1
+                    @unknown default:
+                        break
+                    }
+                }
+                recoverRendererAfterConfigurationChange(suggestedFlushTime: flushTime)
+                return true
+            case .cancelledDueToFlush:
+                recoverRendererAfterConfigurationChange()
+                return true
+            case .cancelledDueToError(let error):
+                deliverFailure(RelayError.rendererFailed(error.localizedDescription))
+                return false
+            @unknown default:
+                deliverFailure(RelayError.rendererFailed("Unrecognized audio enqueue result"))
+                return false
+            }
+        }
+        #endif
+        renderer.enqueue(sampleBuffer)
+        return true
+    }
+
+    private func flushRenderer() {
+        #if compiler(>=6.4)
+        if #available(macOS 27.0, *),
+           let receiver = modernReceiver as? AVSampleBufferAudioRenderer.Receiver {
+            receiver.flush()
+            return
+        }
+        #endif
+        renderer.flush()
+    }
+
+    func diagnostics() -> String {
+        performSync {
+            let backend = modernReceiver == nil ? "Legacy renderer" : "macOS 27 receiver"
+            return """
+            Backend: \(backend)
+            Output routing: system default
+            Renderer status: \(renderer.status.rawValue)
+            Renderer error: \(renderer.error?.localizedDescription ?? "None")
+            Timeline rate: \(synchronizer.rate)
+            Output configuration events: \(configurationChangeCount)
+            Automatic flushes: \(automaticFlushCount)
+            Last recovery: \(lastRecovery)
+            Captured frames: \(capture.capturedFrameCount)
+            Buffered frames: \(capture.availableFrameCount)
+            Dropped frames: \(capture.droppedFrameCount)
+            Format mismatches: \(capture.formatMismatchCount)
+            """
+        }
     }
 
     private func installRendererObservers() {
+        // Do not handle the same transition twice: the macOS 27 receiver reports
+        // configuration/flush events as part of enqueueImmediately's result.
+        if #available(macOS 27.0, *), modernReceiver != nil { return }
         let center = NotificationCenter.default
         let outputToken = center.addObserver(
             forName: .AVSampleBufferAudioRendererOutputConfigurationDidChange,
@@ -359,6 +484,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
         ) { [weak self] _ in
             guard let self else { return }
             self.serializationQueue.async { [self] in
+                self.configurationChangeCount += 1
                 self.recoverRendererAfterConfigurationChange()
             }
         }
@@ -372,6 +498,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
             guard let self else { return }
             let flushTime = (notification.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)?.timeValue
             self.serializationQueue.async { [self] in
+                self.automaticFlushCount += 1
                 self.recoverRendererAfterConfigurationChange(suggestedFlushTime: flushTime)
             }
         }
@@ -412,7 +539,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
     }
 }
 
-private final class PCMSampleBufferFactory {
+final class PCMSampleBufferFactory {
     private let formatDescription: CMAudioFormatDescription
     private let timescale: CMTimeScale
 
@@ -434,12 +561,18 @@ private final class PCMSampleBufferFactory {
             mBitsPerChannel: 32,
             mReserved: 0
         )
+        var layout = AudioChannelLayout(
+            mChannelLayoutTag: kAudioChannelLayoutTag_Stereo,
+            mChannelBitmap: AudioChannelBitmap(rawValue: 0),
+            mNumberChannelDescriptions: 0,
+            mChannelDescriptions: AudioChannelDescription()
+        )
         var description: CMAudioFormatDescription?
         let status = CMAudioFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
             asbd: &format,
-            layoutSize: 0,
-            layout: nil,
+            layoutSize: MemoryLayout<AudioChannelLayout>.size,
+            layout: &layout,
             magicCookieSize: 0,
             magicCookie: nil,
             extensions: nil,
